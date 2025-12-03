@@ -280,6 +280,13 @@ PERMISSION_PATTERNS = [
     r"\[Y/n\]",
     r"\(y/N\)",
     r"Press Enter to continue",
+    r"Press Enter",
+]
+
+# Patterns that should auto-accept immediately (startup prompts)
+AUTO_ENTER_PATTERNS = [
+    r"Press Enter to continue",
+    r"Welcome to Claude Code",
 ]
 
 # Patterns that indicate human decision is needed
@@ -306,16 +313,32 @@ def needs_human_decision(output: str) -> bool:
     return any(re.search(p, output, re.IGNORECASE) for p in HUMAN_NEEDED_PATTERNS)
 
 
+def should_auto_enter(output: str) -> bool:
+    """Check if this is a startup prompt that should auto-accept Enter."""
+    return any(re.search(p, output) for p in AUTO_ENTER_PATTERNS)
+
+
 async def auto_accept_if_safe(ticket: str, output: str) -> bool:
     """Auto-accept permission prompts if session has auto_accept enabled and it's safe.
 
     Flow:
-    1. Check if auto_accept is enabled for this session
-    2. Check if this looks like a permission prompt (Yes/No question)
-    3. Check if human decision is actually needed (clarification, design choices)
-    4. Call Azure OpenAI to verify safety (no destructive operations)
-    5. If safe, send "1" to select "Yes" option
+    1. Check for startup prompts (always auto-enter)
+    2. Check if auto_accept is enabled for this session
+    3. Check if this looks like a permission prompt (Yes/No question)
+    4. Check if human decision is actually needed (clarification, design choices)
+    5. Call Azure OpenAI to verify safety (no destructive operations)
+    6. If safe, send "1" to select "Yes" option or just Enter
     """
+    # Always auto-accept startup prompts (even in planning mode)
+    if should_auto_enter(output):
+        try:
+            subprocess.run(["tmux", "send-keys", "-t", ticket, "Enter"], check=True, timeout=5)
+            print(f"[ParaPR] {ticket}: Auto-entered startup prompt")
+            return True
+        except Exception as e:
+            print(f"[ParaPR] {ticket}: Auto-enter failed: {e}")
+            return False
+    
     if ticket not in sessions or not sessions[ticket].auto_accept:
         return False
 
@@ -599,6 +622,7 @@ DASHBOARD_HTML = """
                             <button class="send" onclick="sendInput('${ticket}')">Send</button>
                             <button onclick="sendQuick('${ticket}', 'yes')">yes</button>
                             <button onclick="sendQuick('${ticket}', 'no')">no</button>
+                            <button onclick="sendEnter('${ticket}')">↵ Enter</button>
                             <button onclick="sendQuick('${ticket}', 'continue')">continue</button>
                             <button class="danger" onclick="interrupt('${ticket}')">^C</button>
                         </div>
@@ -653,11 +677,24 @@ DASHBOARD_HTML = """
         }
 
         async function startSession(ticket) {
+            // Show starting feedback in sidebar
+            const sidebarItem = document.querySelector(`[onclick="startSession('${ticket}')"]`);
+            if (sidebarItem) {
+                sidebarItem.innerHTML = '<span class="dot"></span>Starting...';
+                sidebarItem.style.pointerEvents = 'none';
+            }
+            
             const res = await fetch(`/sessions/${ticket}/start`, {method: 'POST'});
             if (res.ok) {
+                await new Promise(r => setTimeout(r, 1000)); // Wait for session to start
                 await fetchSessions();
                 await fetchWorktrees();
                 togglePanel(ticket);
+            } else {
+                if (sidebarItem) {
+                    sidebarItem.innerHTML = '<span class="dot inactive"></span>' + ticket + ' (failed)';
+                    sidebarItem.style.pointerEvents = 'auto';
+                }
             }
         }
 
@@ -680,6 +717,10 @@ DASHBOARD_HTML = """
                 headers: {'Content-Type': 'application/json'},
                 body: JSON.stringify({text: cmd})
             });
+        }
+
+        async function sendEnter(ticket) {
+            await fetch(`/session/${ticket}/enter`, {method: 'POST'});
         }
 
         async function interrupt(ticket) {
@@ -725,15 +766,33 @@ DASHBOARD_HTML = """
 
         async function startAll() {
             const btn = event.target;
-            btn.textContent = 'Starting...';
+            const originalText = btn.textContent;
             btn.disabled = true;
+            
             try {
-                await fetch('/sessions/start-all', {method: 'POST'});
-                await new Promise(r => setTimeout(r, 2000));
+                btn.textContent = '⏳ Starting sessions...';
+                const res = await fetch('/sessions/start-all', {method: 'POST'});
+                const data = await res.json();
+                
+                if (data.ok && data.tickets) {
+                    btn.textContent = `⏳ Started ${data.tickets.length} sessions`;
+                    await new Promise(r => setTimeout(r, 2000));
+                    
+                    // Auto-open panels for started sessions
+                    for (const ticket of data.tickets) {
+                        if (!gridSessions.has(ticket)) {
+                            gridSessions.add(ticket);
+                            connectWS(ticket);
+                        }
+                    }
+                }
+                
                 await fetchSessions();
                 await fetchWorktrees();
+                renderSidebar();
+                renderGrid();
             } finally {
-                btn.textContent = '▶ Start All';
+                btn.textContent = originalText;
                 btn.disabled = false;
             }
         }
@@ -815,8 +874,12 @@ async def start_all_sessions():
         if not info["active"]
     ]
     if not tickets_to_start:
-        return {"ok": True, "message": "No worktrees to start", "started": []}
-    return start_session(tickets_to_start)
+        return {"ok": True, "message": "No worktrees to start", "tickets": []}
+    result = start_session(tickets_to_start)
+    # Ensure tickets key is included
+    if "tickets" not in result:
+        result["tickets"] = tickets_to_start if result.get("ok") else []
+    return result
 
 
 @app.post("/sessions/kill-all")
@@ -880,6 +943,16 @@ async def interrupt_session(ticket: str):
     """Send Ctrl+C to tmux session."""
     try:
         subprocess.run(["tmux", "send-keys", "-t", ticket, "C-c"], check=True, timeout=5)
+        return {"ok": True}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+@app.post("/session/{ticket}/enter")
+async def send_enter(ticket: str):
+    """Send Enter key to tmux session."""
+    try:
+        subprocess.run(["tmux", "send-keys", "-t", ticket, "Enter"], check=True, timeout=5)
         return {"ok": True}
     except Exception as e:
         return {"ok": False, "error": str(e)}
