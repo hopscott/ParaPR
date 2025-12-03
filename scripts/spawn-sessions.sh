@@ -7,8 +7,11 @@
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 ORCHESTRATOR_URL="${ORCHESTRATOR_URL:-http://localhost:8765}"
+
+# Use WORKTREES_DIR from environment or default to REPO_ROOT/worktrees
+WORKTREES_BASE="${WORKTREES_DIR:-${REPO_ROOT}/worktrees}"
 
 # Note: direnv allow removed - was causing hangs
 
@@ -16,11 +19,11 @@ ORCHESTRATOR_URL="${ORCHESTRATOR_URL:-http://localhost:8765}"
 if [ $# -gt 0 ]; then
     TICKETS=("$@")
 else
-    TICKETS=($(ls -1 "${REPO_ROOT}/worktrees" 2>/dev/null || echo ""))
+    TICKETS=($(ls -1 "${WORKTREES_BASE}" 2>/dev/null || echo ""))
 fi
 
 if [ ${#TICKETS[@]} -eq 0 ]; then
-    echo "No worktrees found in ${REPO_ROOT}/worktrees"
+    echo "No worktrees found in ${WORKTREES_BASE}"
     exit 1
 fi
 
@@ -38,7 +41,7 @@ if ! curl -s --connect-timeout 2 --max-time 2 "${ORCHESTRATOR_URL}/sessions" > /
 fi
 
 for ticket in "${TICKETS[@]}"; do
-    WORKTREE_PATH="${REPO_ROOT}/worktrees/${ticket}/pipeline"
+    WORKTREE_PATH="${WORKTREES_BASE}/${ticket}/pipeline"
 
     if [ ! -d "${WORKTREE_PATH}" ]; then
         echo "Skipping ${ticket}: pipeline directory not found"

@@ -37,9 +37,8 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="ParaPR - Parallel PR Orchestrator", lifespan=lifespan)
 
-# Get repo root (one level up from src/)
-REPO_ROOT = Path(__file__).parent.parent.parent.parent
-WORKTREES_DIR = REPO_ROOT / "worktrees"
+# Get worktrees directory from environment variable or default
+WORKTREES_DIR = Path(os.getenv("WORKTREES_DIR", Path(__file__).parent.parent / "worktrees"))
 
 
 class SessionState(str, Enum):
