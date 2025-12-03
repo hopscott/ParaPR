@@ -236,7 +236,12 @@ def start_session(tickets: list[str]) -> dict:
     # Initialize session state for each ticket
     for ticket in tickets:
         if ticket not in sessions:
-            sessions[ticket] = SessionStatus(ticket=ticket, current_workflow_stage="linear")
+            sessions[ticket] = SessionStatus(
+                ticket=ticket, 
+                current_workflow_stage="linear",
+                auto_accept=True,  # Enable auto-accept by default for workflow
+                claude_mode=ClaudeMode.AUTO_ACCEPT
+            )
             output_buffers[ticket] = []
             
             # Auto-run /linear command after a short delay
@@ -718,8 +723,8 @@ DASHBOARD_HTML = """
                         <div class="session-panel-input">
                             <input type="text" id="input-${ticket}" placeholder="Send to Claude..." onkeypress="if(event.key==='Enter')sendInput('${ticket}')">
                             <button class="send" onclick="sendInput('${ticket}')">Send</button>
-                            <button onclick="sendQuick('${ticket}', 'yes')">yes</button>
-                            <button onclick="sendQuick('${ticket}', 'no')">no</button>
+                            <button onclick="sendQuick('${ticket}', '1')" style="background:#238636;color:#fff;">1. Yes</button>
+                            <button onclick="sendQuick('${ticket}', '2')">2. No</button>
                             <button onclick="sendEnter('${ticket}')">↵ Enter</button>
                             <button onclick="sendQuick('${ticket}', 'continue')">continue</button>
                             <button class="danger" onclick="interrupt('${ticket}')">^C</button>
@@ -1147,6 +1152,9 @@ async def update_stage(ticket: str, stage: str, done: bool):
         if stage == "specify" and done:
             sessions[ticket].waiting_for_user = False
             sessions[ticket].workflow_enabled = True
+            sessions[ticket].auto_accept = True  # Enable auto-accept for workflow
+            sessions[ticket].claude_mode = ClaudeMode.AUTO_ACCEPT
+            print(f"[ParaPR] {ticket}: Workflow started, auto-accept enabled")
             # Advance to next stage
             await advance_workflow(ticket)
         
