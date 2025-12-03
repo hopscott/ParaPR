@@ -100,7 +100,7 @@ MAX_BUFFER_LINES = 200
 
 # Azure OpenAI client for safety checks (uses GPT-4o)
 llm_client: AsyncAzureOpenAI | None = None
-llm_deployment_name: str = "GPT_4O_GLOBAL"  # Default deployment name
+llm_deployment_name: str = ""  # Set from environment variables
 
 SAFETY_CHECK_PROMPT = """You are a safety monitor for Claude Code sessions running in parallel.
 Your job is to determine if a permission prompt can be auto-accepted or needs human attention.
