@@ -75,6 +75,9 @@ class SessionStatus(BaseModel):
     linear_description: str = ""
     in_grid: bool = False  # Whether session is shown in grid view
     claude_mode: ClaudeMode = ClaudeMode.PLANNING  # Current Claude Code mode
+    workflow_enabled: bool = True  # Auto-run workflow stages
+    waiting_for_user: bool = False  # Paused waiting for user confirmation
+    current_workflow_stage: str = "linear"  # Current stage in workflow
 
 
 class SafetyCheckResponse(BaseModel):
@@ -97,6 +100,10 @@ ws_connections: dict[str, list[WebSocket]] = {}
 output_buffers: dict[str, list[str]] = {}
 MAX_BUFFER_LINES = 200
 
+# Track last processed output to avoid duplicate safety checks
+last_checked_output: dict[str, str] = {}
+last_check_hash: dict[str, int] = {}
+
 # Azure OpenAI client for safety checks (uses GPT-4o)
 llm_client: AsyncAzureOpenAI | None = None
 llm_deployment_name: str = ""  # Set from environment variables
@@ -104,38 +111,44 @@ llm_deployment_name: str = ""  # Set from environment variables
 SAFETY_CHECK_PROMPT = """You are a safety monitor for Claude Code sessions running in parallel.
 Your job is to determine if a permission prompt can be auto-accepted or needs human attention.
 
+FOCUS ON THE COMMAND BEING RUN, NOT THE ENVIRONMENT CONTEXT.
+If you see API keys or secrets in the context, ignore them unless the command is trying to MODIFY them.
+
 ## NEEDS_CLARIFICATION = True (REQUIRES HUMAN)
 - Design decisions or architectural choices ("which approach", "how should we")
 - Multiple implementation options presented for selection
 - Requirements clarification needed
 - Questions about business logic or domain knowledge
-- "Type here to tell Claude" option is shown
+- "Type here to tell Claude" option is shown AND it's about design/architecture
 - Any open-ended question requiring human judgment
 
 ## NEEDS_CLARIFICATION = False (CAN AUTO-ACCEPT)
 - Simple Yes/No permission to run a command
 - Permission to read files (cat, head, tail, read)
 - Permission to search code (grep, glob, find)
-- Permission to run linearis/linear commands
+- Permission to run linearis/linear commands (read, list, etc)
 - Permission to run tests, linters, type checks
 - Permission to create/edit source code files
 - Permission to run git status, diff, log, branch
 
 ## SAFE_TO_CONTINUE = False (DANGEROUS - BLOCK)
 - DELETE operations: rm, rm -rf, unlink, rmdir
-- Database drops: DROP TABLE, DROP DATABASE, TRUNCATE
+- Database WRITE operations: DROP TABLE, DROP DATABASE, TRUNCATE, DELETE FROM
 - Git force operations: push --force, push -f, reset --hard
-- Production/secrets: .env files, credentials, API keys
-- System files: /etc, /usr, ~/.ssh, ~/.config
+- MODIFYING .env files, credentials, or API keys
+- MODIFYING system files: /etc, /usr, ~/.ssh, ~/.config
 
 ## SAFE_TO_CONTINUE = True (SAFE)
-- All read operations
-- All search operations
-- Creating new files
-- Editing existing code
-- Running tests
-- Normal git operations (commit, push, pull, branch)
-- Package install (npm install, pip install)
+- All READ operations (linearis read, cat, head, tail, grep)
+- All search operations (find, glob, grep)
+- Creating new SOURCE CODE files (.py, .js, .ts, etc)
+- Editing existing SOURCE CODE files
+- Running tests, linters, type checkers
+- Normal git operations (commit, push, pull, branch, checkout)
+- Package install (npm install, pip install, poetry install)
+- VIEWING .env files is OK, MODIFYING them is NOT
+
+IMPORTANT: If API keys appear in the terminal context but the command is a READ operation, return safe_to_continue=True.
 
 Return JSON: {"needs_clarification": bool, "safe_to_continue": bool, "reason": "brief explanation"}"""
 
@@ -223,8 +236,11 @@ def start_session(tickets: list[str]) -> dict:
     # Initialize session state for each ticket
     for ticket in tickets:
         if ticket not in sessions:
-            sessions[ticket] = SessionStatus(ticket=ticket)
+            sessions[ticket] = SessionStatus(ticket=ticket, current_workflow_stage="linear")
             output_buffers[ticket] = []
+            
+            # Auto-run /linear command after a short delay
+            asyncio.create_task(auto_run_linear(ticket))
 
     return {
         "ok": result.returncode == 0,
@@ -232,6 +248,24 @@ def start_session(tickets: list[str]) -> dict:
         "output": result.stdout,
         "error": result.stderr if result.returncode != 0 else None
     }
+
+
+async def auto_run_linear(ticket: str):
+    """Auto-run /linear command after session starts."""
+    await asyncio.sleep(3)  # Wait for Claude to fully start
+    try:
+        # Send /linear command
+        subprocess.run(["tmux", "send-keys", "-t", ticket, "C-u"], timeout=5)
+        time.sleep(0.1)
+        subprocess.run(["tmux", "send-keys", "-t", ticket, "-l", f"/linear {ticket.upper()}"], timeout=5)
+        subprocess.run(["tmux", "send-keys", "-t", ticket, "Enter"], timeout=5)
+        print(f"[ParaPR] {ticket}: Auto-started /linear workflow")
+        
+        if ticket in sessions:
+            sessions[ticket].current_workflow_stage = "linear"
+            sessions[ticket].waiting_for_user = False
+    except Exception as e:
+        print(f"[ParaPR] {ticket}: Failed to auto-run /linear: {e}")
 
 
 async def check_safety(ticket: str, output: str) -> SafetyCheckResponse:
@@ -302,6 +336,31 @@ HUMAN_NEEDED_PATTERNS = [
     r"multiple (?:options|approaches|ways)",
 ]
 
+# Patterns that indicate command completion
+COMPLETION_PATTERNS = {
+    "linear": [
+        r"Issue TE-\d+.*fetched",
+        r"Linear ticket.*loaded",
+        r"Successfully fetched",
+    ],
+    "specify": [
+        r"Specification complete",
+        r"Requirements documented",
+    ],
+    "plan": [
+        r"Plan complete",
+        r"Implementation plan ready",
+    ],
+    "tasks": [
+        r"Tasks defined",
+        r"Task breakdown complete",
+    ],
+    "implement": [
+        r"Implementation complete",
+        r"All tasks completed",
+    ],
+}
+
 
 def is_permission_prompt(output: str) -> bool:
     """Detect if Claude is showing a Yes/No permission prompt."""
@@ -334,6 +393,9 @@ async def auto_accept_if_safe(ticket: str, output: str) -> bool:
         try:
             subprocess.run(["tmux", "send-keys", "-t", ticket, "Enter"], check=True, timeout=5)
             print(f"[ParaPR] {ticket}: Auto-entered startup prompt")
+            # Reset hash so next prompt is checked
+            if ticket in last_check_hash:
+                del last_check_hash[ticket]
             return True
         except Exception as e:
             print(f"[ParaPR] {ticket}: Auto-enter failed: {e}")
@@ -360,6 +422,9 @@ async def auto_accept_if_safe(ticket: str, output: str) -> bool:
             subprocess.run(["tmux", "send-keys", "-t", ticket, "-l", "1"], check=True, timeout=5)
             subprocess.run(["tmux", "send-keys", "-t", ticket, "Enter"], check=True, timeout=5)
             print(f"[ParaPR] {ticket}: Auto-accepted (safe operation)")
+            # Reset hash so next prompt is checked
+            if ticket in last_check_hash:
+                del last_check_hash[ticket]
             return True
         except Exception as e:
             print(f"[ParaPR] {ticket}: Auto-accept failed: {e}")
@@ -391,26 +456,52 @@ async def stream_output(ticket: str, websocket: WebSocket):
                     output_buffers[ticket].extend(new_content.split("\n"))
                     output_buffers[ticket] = output_buffers[ticket][-MAX_BUFFER_LINES:]
 
-                    # Check for permission prompts and auto-accept if enabled
-                    auto_accepted = await auto_accept_if_safe(ticket, current_output)
+                    # Calculate hash of current output to avoid duplicate checks
+                    current_hash = hash(current_output[-500:])  # Hash last 500 chars
+                    previous_hash = last_check_hash.get(ticket)
+                    
+                    # Only process if output changed significantly
+                    if current_hash != previous_hash:
+                        last_check_hash[ticket] = current_hash
+                        
+                        # Check for permission prompts and auto-accept if enabled
+                        auto_accepted = await auto_accept_if_safe(ticket, current_output)
 
-                    # Check if needs attention (only if not auto-accepted)
-                    if not auto_accepted:
-                        safety = await check_safety(ticket, new_content)
-                        if ticket in sessions:
-                            sessions[ticket].needs_attention = safety.needs_clarification
+                        # Check if needs attention (only if not auto-accepted)
+                        if not auto_accepted:
+                            safety = await check_safety(ticket, new_content)
+                            if ticket in sessions:
+                                prev_attention = sessions[ticket].needs_attention
+                                sessions[ticket].needs_attention = safety.needs_clarification
+                                
+                                # If workflow was running and now needs attention, pause it
+                                if not prev_attention and safety.needs_clarification:
+                                    sessions[ticket].waiting_for_user = True
+                                    print(f"[ParaPR] {ticket}: Workflow paused - needs clarification")
+                        else:
+                            if ticket in sessions:
+                                sessions[ticket].needs_attention = False
+                                # If auto-accepted, try to advance workflow
+                                if sessions[ticket].workflow_enabled and not sessions[ticket].waiting_for_user:
+                                    await advance_workflow(ticket)
+
+                        # Send to WebSocket
+                        await websocket.send_json({
+                            "type": "output",
+                            "ticket": ticket,
+                            "content": new_content,
+                            "needs_attention": sessions.get(ticket, SessionStatus(ticket=ticket)).needs_attention,
+                            "auto_accepted": auto_accepted
+                        })
                     else:
-                        if ticket in sessions:
-                            sessions[ticket].needs_attention = False
-
-                    # Send to WebSocket
-                    await websocket.send_json({
-                        "type": "output",
-                        "ticket": ticket,
-                        "content": new_content,
-                        "needs_attention": sessions.get(ticket, SessionStatus(ticket=ticket)).needs_attention,
-                        "auto_accepted": auto_accepted
-                    })
+                        # Still send output update even if we skip safety check
+                        await websocket.send_json({
+                            "type": "output",
+                            "ticket": ticket,
+                            "content": new_content,
+                            "needs_attention": sessions.get(ticket, SessionStatus(ticket=ticket)).needs_attention,
+                            "auto_accepted": False
+                        })
                 last_output = current_output
             await asyncio.sleep(0.3)
         except WebSocketDisconnect:
@@ -605,10 +696,17 @@ DASHBOARD_HTML = """
                 }).join('');
 
                 const isAutoAccept = info.claude_mode === 'auto_accept' || info.auto_accept;
+                const waitingMsg = info.waiting_for_user ? '<span style="color:#f85149;font-size:0.85em;">⏸ Waiting for review</span>' : '';
+                const workflowMsg = info.message ? `<span style="color:#8b949e;font-size:0.85em;">${escapeHtml(info.message)}</span>` : '';
+                const statusMsg = waitingMsg || workflowMsg || '';
+                
                 html += `
                     <div class="session-panel ${attention}" id="panel-${ticket}">
                         <div class="session-panel-header">
-                            <span class="session-panel-title">${ticket.toUpperCase()}: ${escapeHtml(info.linear_title || info.state || 'Starting...')}</span>
+                            <div style="display:flex;flex-direction:column;gap:4px;flex:1;">
+                                <span class="session-panel-title">${ticket.toUpperCase()}: ${escapeHtml(info.linear_title || info.state || 'Starting...')}</span>
+                                ${statusMsg ? `<div>${statusMsg}</div>` : ''}
+                            </div>
                             <div style="display:flex;gap:8px;align-items:center;">
                                 <button class="${isAutoAccept ? '' : 'active'}" onclick="setMode('${ticket}','planning')" style="padding:4px 8px;border-radius:4px;border:1px solid #30363d;background:${isAutoAccept ? '#21262d' : '#238636'};color:#fff;cursor:pointer;font-size:0.75em;">Planning</button>
                                 <button class="${isAutoAccept ? 'active' : ''}" onclick="setMode('${ticket}','auto_accept')" style="padding:4px 8px;border-radius:4px;border:1px solid #30363d;background:${isAutoAccept ? '#238636' : '#21262d'};color:#fff;cursor:pointer;font-size:0.75em;">Auto</button>
@@ -734,17 +832,21 @@ DASHBOARD_HTML = """
         }
 
         async function runStep(ticket, step) {
-            const cmds = {
-                'linear_pulled': `/linear ${ticket.toUpperCase()}`,
-                'specify_done': '/specify',
-                'clarify_done': '/clarify',
-                'plan_done': '/plan',
-                'tasks_done': '/tasks',
-                'implement_done': '/implement'
+            const stepMap = {
+                'linear_pulled': 'linear',
+                'specify_done': 'specify',
+                'clarify_done': 'clarify',
+                'plan_done': 'plan',
+                'tasks_done': 'tasks',
+                'implement_done': 'implement'
             };
-            if (cmds[step]) {
-                await sendQuick(ticket, cmds[step]);
-                await fetch(`/session/${ticket}/stage?stage=${step.replace('_done','').replace('_pulled','')}&done=true`, {method: 'POST'});
+            
+            const stageName = stepMap[step];
+            if (stageName) {
+                // Mark as done and trigger workflow advancement
+                await fetch(`/session/${ticket}/stage?stage=${stageName}&done=true`, {method: 'POST'});
+                await fetchSessions();
+                renderGrid();
             }
         }
 
@@ -905,6 +1007,10 @@ async def kill_all_sessions():
                 del output_buffers[ticket]
             if ticket in ws_connections:
                 del ws_connections[ticket]
+            if ticket in last_check_hash:
+                del last_check_hash[ticket]
+            if ticket in last_checked_output:
+                del last_checked_output[ticket]
         except Exception as e:
             errors.append({"ticket": ticket, "error": str(e)})
 
@@ -958,9 +1064,65 @@ async def send_enter(ticket: str):
         return {"ok": False, "error": str(e)}
 
 
+async def run_workflow_stage(ticket: str, stage: str):
+    """Run a specific workflow stage command."""
+    commands = {
+        "linear": f"/linear {ticket.upper()}",
+        "specify": "/specify",
+        "clarify": "/clarify",
+        "plan": "/plan",
+        "tasks": "/tasks",
+        "implement": "/implement"
+    }
+    
+    if stage not in commands:
+        return False
+    
+    try:
+        subprocess.run(["tmux", "send-keys", "-t", ticket, "C-u"], timeout=5)
+        time.sleep(0.1)
+        subprocess.run(["tmux", "send-keys", "-t", ticket, "-l", commands[stage]], timeout=5)
+        subprocess.run(["tmux", "send-keys", "-t", ticket, "Enter"], timeout=5)
+        print(f"[ParaPR] {ticket}: Auto-ran {stage}")
+        
+        if ticket in sessions:
+            sessions[ticket].current_workflow_stage = stage
+        return True
+    except Exception as e:
+        print(f"[ParaPR] {ticket}: Failed to run {stage}: {e}")
+        return False
+
+
+async def advance_workflow(ticket: str):
+    """Automatically advance to next workflow stage if enabled."""
+    if ticket not in sessions:
+        return
+    
+    session = sessions[ticket]
+    
+    # Don't advance if workflow is disabled or waiting for user or needs attention
+    if not session.workflow_enabled or session.waiting_for_user or session.needs_attention:
+        return
+    
+    # Determine next stage based on current progress
+    workflow_sequence = [
+        ("linear", "linear_pulled", "specify"),
+        ("specify", "specify_done", "plan"),
+        ("plan", "plan_done", "tasks"),
+        ("tasks", "tasks_done", "implement"),
+    ]
+    
+    for current, done_flag, next_stage in workflow_sequence:
+        if session.current_workflow_stage == current and getattr(session, done_flag):
+            print(f"[ParaPR] {ticket}: {current} complete, advancing to {next_stage}")
+            await asyncio.sleep(2)  # Brief pause between stages
+            await run_workflow_stage(ticket, next_stage)
+            return
+
+
 @app.post("/session/{ticket}/stage")
 async def update_stage(ticket: str, stage: str, done: bool):
-    """Update workflow stage."""
+    """Update workflow stage and potentially advance to next stage."""
     if ticket not in sessions:
         sessions[ticket] = SessionStatus(ticket=ticket)
 
@@ -972,8 +1134,26 @@ async def update_stage(ticket: str, stage: str, done: bool):
         "tasks": "tasks_done",
         "implement": "implement_done"
     }
+    
     if stage in stage_map:
         setattr(sessions[ticket], stage_map[stage], done)
+        
+        # If linear just completed, wait for user to review
+        if stage == "linear" and done:
+            sessions[ticket].waiting_for_user = True
+            sessions[ticket].message = "Review Linear ticket and click Specify to continue"
+        
+        # If specify was clicked, start auto-workflow
+        if stage == "specify" and done:
+            sessions[ticket].waiting_for_user = False
+            sessions[ticket].workflow_enabled = True
+            # Advance to next stage
+            await advance_workflow(ticket)
+        
+        # Auto-advance for other completed stages (if workflow enabled)
+        elif done and stage not in ["linear"]:
+            await advance_workflow(ticket)
+    
     return {"ok": True}
 
 
