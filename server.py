@@ -100,6 +100,7 @@ MAX_BUFFER_LINES = 200
 
 # Azure OpenAI client for safety checks (uses GPT-4o)
 llm_client: AsyncAzureOpenAI | None = None
+llm_deployment_name: str = "GPT_4O_GLOBAL"  # Default deployment name
 
 SAFETY_CHECK_PROMPT = """You are a safety monitor for Claude Code sessions running in parallel.
 Your job is to determine if a permission prompt can be auto-accepted or needs human attention.
@@ -141,18 +142,45 @@ Return JSON: {"needs_clarification": bool, "safe_to_continue": bool, "reason": "
 
 
 def init_llm_client():
-    """Initialize Azure OpenAI client if credentials available."""
-    global llm_client
-    api_base = os.getenv("AZ_OPENAI_API_BASE")
-    api_key = os.getenv("AZ_OPENAI_API_KEY")
-    api_version = os.getenv("RMTQ_BETA_CMD_AZ_OPENAI_API_VERSION", "2024-02-15-preview")
-    if api_base and api_key:
-        llm_client = AsyncAzureOpenAI(
-            azure_endpoint=api_base,
-            api_key=api_key,
-            api_version=api_version
+    """Initialize Azure OpenAI client if credentials available.
+    
+    Supports two modes:
+    1. LiteLLM Proxy (preferred) - supports GPT-5.1 and automatic failover
+    2. Direct Azure OpenAI - for backward compatibility
+    """
+    global llm_client, llm_deployment_name
+    
+    # Check for LiteLLM proxy first (preferred for GPT-5.1)
+    litellm_url = os.getenv("LITELLM_PROXY_URL")
+    litellm_key = os.getenv("LITELLM_PROXY_KEY")
+    
+    if litellm_url and litellm_key:
+        # Use LiteLLM proxy (supports GPT-5.1)
+        llm_deployment_name = os.getenv("LLM_MODEL", "gpt-5.1")  # Default to GPT-5.1
+        from openai import AsyncOpenAI
+        llm_client = AsyncOpenAI(
+            base_url=f"{litellm_url.rstrip('/')}/v1",
+            api_key=litellm_key
         )
-        print(f"[ParaPR] LLM client initialized with Azure OpenAI: {api_base}")
+        print(f"[ParaPR] LLM client initialized with LiteLLM proxy: {litellm_url}")
+        print(f"[ParaPR] Using model: {llm_deployment_name}")
+    else:
+        # Fall back to direct Azure OpenAI
+        api_base = os.getenv("AZ_OPENAI_API_BASE")
+        api_key = os.getenv("AZ_OPENAI_API_KEY")
+        api_version = os.getenv("AZ_OPENAI_API_VERSION", "2024-10-21")
+        llm_deployment_name = os.getenv("AZ_OPENAI_DEPLOYMENT_NAME", "GPT_4O_GLOBAL")
+        
+        if api_base and api_key:
+            llm_client = AsyncAzureOpenAI(
+                azure_endpoint=api_base,
+                api_key=api_key,
+                api_version=api_version
+            )
+            print(f"[ParaPR] LLM client initialized with Azure OpenAI: {api_base}")
+            print(f"[ParaPR] Using deployment: {llm_deployment_name}, API version: {api_version}")
+        else:
+            print("[ParaPR] Warning: No LLM credentials configured - safety checks will use fallback patterns")
 
 
 def get_worktrees() -> dict[str, dict]:
@@ -222,7 +250,7 @@ async def check_safety(ticket: str, output: str) -> SafetyCheckResponse:
     try:
         context = "\n".join(output_buffers.get(ticket, [])[-50:])
         response = await llm_client.chat.completions.create(
-            model="gpt-4o",  # GPT-4o via Azure OpenAI
+            model=llm_deployment_name,  # Azure OpenAI deployment name
             messages=[
                 {"role": "system", "content": SAFETY_CHECK_PROMPT},
                 {"role": "user", "content": f"Session: {ticket}\nContext:\n{context}\n\nLatest output:\n{output}"}
