@@ -37,8 +37,8 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="ParaPR - Parallel PR Orchestrator", lifespan=lifespan)
 
-# Get repo root (two levels up from scripts/ParaPR)
-REPO_ROOT = Path(__file__).parent.parent.parent
+# Get repo root (one level up from src/)
+REPO_ROOT = Path(__file__).parent.parent.parent.parent
 WORKTREES_DIR = REPO_ROOT / "worktrees"
 
 
@@ -208,7 +208,7 @@ def get_worktrees() -> dict[str, dict]:
 
 def start_session(tickets: list[str]) -> dict:
     """Start Claude Code sessions using spawn-sessions.sh."""
-    script_path = Path(__file__).parent / "spawn-sessions.sh"
+    script_path = Path(__file__).parent.parent / "scripts" / "spawn-sessions.sh"
 
     if not script_path.exists():
         return {"ok": False, "error": "spawn-sessions.sh not found"}

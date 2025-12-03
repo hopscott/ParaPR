@@ -40,7 +40,7 @@ open http://localhost:8765
 poetry install
 
 # 2. Start the server
-python server.py
+python -m src.server
 
 # 3. Open dashboard
 open http://localhost:8765
@@ -196,7 +196,8 @@ make health        # Check server health
 
 ```
 parapr/
-├── server.py              # FastAPI server with AI safety checks
+├── src/
+│   └── server.py          # FastAPI server with AI safety checks
 ├── scripts/
 │   ├── worktree-setup.sh  # Set up git worktrees
 │   └── spawn-sessions.sh  # Create tmux sessions
@@ -217,10 +218,10 @@ parapr/
 poetry install
 
 # Run server
-python server.py
+python -m src.server
 
 # Run with auto-reload
-uvicorn server:app --reload --port 8765
+uvicorn src.server:app --reload --port 8765
 ```
 
 ### Docker Development

@@ -33,7 +33,7 @@ echo ""
 # Check if orchestrator is running (with 2s timeout)
 if ! curl -s --connect-timeout 2 --max-time 2 "${ORCHESTRATOR_URL}/sessions" > /dev/null 2>&1; then
     echo "Warning: Orchestrator not responding at ${ORCHESTRATOR_URL}"
-    echo "Start it with: cd ${SCRIPT_DIR} && python server.py"
+    echo "Start it with: cd ${SCRIPT_DIR}/.. && python -m src.server"
     echo ""
 fi
 
