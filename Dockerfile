@@ -9,8 +9,9 @@ RUN apt-get update && \
 # Set working directory
 WORKDIR /app
 
-# Install poetry for dependency management
-RUN pip install poetry==1.7.1
+# Install poetry for dependency management using official installer
+RUN curl -sSL https://install.python-poetry.org | python3 - && \
+    ln -s /root/.local/bin/poetry /usr/local/bin/poetry
 
 # Copy dependency files
 COPY pyproject.toml poetry.lock* ./
@@ -21,10 +22,10 @@ RUN poetry config virtualenvs.create false && \
 
 # Copy application code
 COPY server.py .
-COPY spawn-sessions.sh session-dashboard.sh ./
+COPY scripts/spawn-sessions.sh ./
 
 # Make scripts executable
-RUN chmod +x spawn-sessions.sh session-dashboard.sh
+RUN chmod +x spawn-sessions.sh
 
 # Expose port
 EXPOSE 8765
